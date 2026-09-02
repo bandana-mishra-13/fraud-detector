@@ -74,7 +74,7 @@ backend/storage/*.sqlite
 
 # Large Data & Datasets (never commit >100MB to git)
 archive/
-*.csv
+backend/data/*.csv
 !backend/data/synthetic_transactions.csv
 *.zip
 *.tar.gz
