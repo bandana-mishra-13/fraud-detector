@@ -1,3 +1,5 @@
+from typing import Any
+
 import httpx
 
 from app.core.config import settings
@@ -7,9 +9,9 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 async def chat_completion(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     model: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     if not settings.OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
 
@@ -28,7 +30,7 @@ async def chat_completion(
         timeout=60.0,
     ) as client:
         response = await client.post(
-            "/chat/completions",
+            "chat/completions",
             headers=headers,
             json=payload,
         )
