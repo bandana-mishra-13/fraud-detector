@@ -26,6 +26,9 @@ venv/
 ENV/
 env/
 *.venv
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
@@ -41,6 +44,49 @@ env/
 *.pem
 *.key
 *.pfx
+
+# Node.js & Frontend (Next.js)
+node_modules/
+.next/
+out/
+coverage/
+.npm
+.yarn/
+.pnpm-store/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Machine Learning Artifacts & Databases
+*.db
+*.sqlite
+*.sqlite3
+backend/storage/*.db
+backend/storage/*.sqlite
+backend/data/*.csv
+*.pkl
+*.joblib
+*.onnx
+*.h5
+*.pt
+*.pth
+
+# Large Data & Datasets (never commit >100MB to git)
+archive/
+*.csv
+*.zip
+*.tar.gz
+*.parquet
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Logs
+*.log
+logs/
 
 # Operating System & IDEs
 .DS_Store
@@ -59,34 +105,3 @@ Thumbs.db
 *.swp
 *.swo
 *~
-
-# Node.js & Frontend (Next.js)
-node_modules/
-.next/
-out/
-coverage/
-.npm
-.yarn/
-.pnpm-store/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Machine Learning Artifacts & Databases
-*.db
-*.sqlite
-*.sqlite3
-*.pkl
-*.joblib
-*.onnx
-*.h5
-*.pt
-*.pth
-
-# Data & Logs
-*.log
-logs/
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
