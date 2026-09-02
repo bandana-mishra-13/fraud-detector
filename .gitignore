@@ -65,7 +65,6 @@ yarn-error.log*
 *.sqlite3
 backend/storage/*.db
 backend/storage/*.sqlite
-backend/data/*.csv
 *.pkl
 *.joblib
 *.onnx
@@ -76,6 +75,7 @@ backend/data/*.csv
 # Large Data & Datasets (never commit >100MB to git)
 archive/
 *.csv
+!backend/data/synthetic_transactions.csv
 *.zip
 *.tar.gz
 *.parquet
