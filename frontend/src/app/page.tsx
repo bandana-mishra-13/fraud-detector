@@ -34,6 +34,7 @@ import { ResultsTable } from "@/components/ResultsTable";
 import { ExecutionPlanTimeline } from "@/components/ExecutionPlanTimeline";
 import { ExecutiveSummaryCard } from "@/components/ExecutiveSummaryCard";
 import { ExplanationEvidenceDrawer, ExplanationDrawerData } from "@/components/ExplanationEvidenceDrawer";
+import { AnalyticsCharts } from "@/components/AnalyticsCharts";
 import { getMockResponseForQuery } from "@/lib/mockData";
 
 export default function Home() {
@@ -243,6 +244,12 @@ export default function Home() {
             <ExecutiveSummaryCard
               synthesizedResult={queryResponse.synthesized_result}
               riskResult={queryResponse.risk_result}
+            />
+
+            {/* Visual Analytics (Task 4.5) */}
+            <AnalyticsCharts
+              edaSummary={queryResponse.eda_summary}
+              flags={queryResponse.flags}
             />
 
             {/* Tab Navigation */}
