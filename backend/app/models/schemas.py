@@ -64,6 +64,31 @@ class ParsedIntent(BaseModel):
     raw_llm_response: Optional[str] = Field(default=None, description="Raw LLM JSON response for debugging/auditing")
 
 
+class SynthesizedResult(BaseModel):
+    """
+    Structured natural-language synthesis of AML query analysis results.
+    Combines executive summary, key AML findings, cited transaction IDs, and limitations.
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+    executive_summary: str = Field(
+        ...,
+        description="High-level executive summary of the investigation results and workflow outcome."
+    )
+    key_findings: List[str] = Field(
+        default_factory=list,
+        description="Bullet-point list of key AML findings grounded strictly in deterministic tool outputs."
+    )
+    cited_transaction_ids: List[str] = Field(
+        default_factory=list,
+        description="List of supporting transaction IDs cited across the key findings."
+    )
+    limitations: List[str] = Field(
+        default_factory=list,
+        description="Limitations or noted workflow caveats (e.g., skipped tools, partial data, errors)."
+    )
+
+
 def generate_uuid() -> str:
     """Utility to generate a string UUID4."""
     return str(uuid.uuid4())

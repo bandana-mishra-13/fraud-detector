@@ -125,7 +125,7 @@ def test_plan_from_direct_parsed_intent_object():
     assert plan.invoked_tools == ["detectors_rules", "risk", "explain"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_create_execution_plan_async():
     """Verify asynchronous execution plan generation."""
     query = "Investigate account ACC015"

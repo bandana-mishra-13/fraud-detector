@@ -6,7 +6,7 @@ import pytest
 from app.core import openrouter
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_chat_completion_sends_expected_openrouter_request(monkeypatch):
     captured_request: dict[str, httpx.Request] = {}
     expected_response = {"id": "test-response", "choices": []}
