@@ -16,6 +16,10 @@ from app.tools.eda import (
     get_volume_distribution,
     run_eda,
 )
+from app.tools.explain import (
+    explain_flag,
+    explain_flags,
+)
 from app.tools.risk import (
     calculate_rule_score,
     determine_risk_tier,
@@ -46,4 +50,6 @@ __all__ = [
     "fuse_entity_risk",
     "fuse_transaction_risk",
     "fuse_overall_risk",
+    "explain_flag",
+    "explain_flags",
 ]
