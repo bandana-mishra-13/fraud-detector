@@ -4,7 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.api.audit import router as audit_router
 from app.api.health import router as health_router
+from app.api.query import router as query_router
 from app.storage import get_audit_store
 
 
@@ -37,9 +39,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register health check at root /health and under API prefix
+# Register API routes at root and under versioned prefix
 app.include_router(health_router)
+app.include_router(query_router)
+app.include_router(audit_router)
+
 app.include_router(health_router, prefix=settings.API_V1_STR)
+app.include_router(query_router, prefix=settings.API_V1_STR)
+app.include_router(audit_router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Root"])
