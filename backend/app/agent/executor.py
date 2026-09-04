@@ -1,11 +1,19 @@
 """Sequential execution of planner-generated AML investigation plans."""
 
+from copy import deepcopy
+import time
 from typing import Any, Final
 
 import numpy as np
 import pandas as pd
 
-from app.models.schemas import ExecutionPlan, PlanStep, StepStatus
+from app.models.schemas import (
+    ExecutionPlan,
+    ExecutionTrace,
+    PlanStep,
+    StepStatus,
+    TraceStatus,
+)
 from app.tools.detectors import run_rule_detectors
 from app.tools.eda import run_eda
 from app.tools.explain import explain_flags
@@ -27,6 +35,7 @@ def execute_plan(
     Execution stops after the first failed step. The returned context records
     failure details, while the caller's plan and DataFrame remain unchanged.
     """
+    workflow_start = time.perf_counter()
     execution_plan = plan.model_copy(deep=True)
     execution_plan.steps = sorted(
         execution_plan.steps,
@@ -37,9 +46,15 @@ def execute_plan(
         RAW_TRANSACTIONS: raw_transactions,
         CURRENT_TRANSACTIONS: raw_transactions,
     }
+    invoked_tools: list[str] = []
+    execution_timings_ms: dict[str, float] = {}
+    completed_steps = 0
+    failed_tool: str | None = None
 
     for step in execution_plan.steps:
         step.status = StepStatus.IN_PROGRESS
+        invoked_tools.append(step.tool_name)
+        step_start = time.perf_counter()
         try:
             result, summary = _dispatch_step(step, execution_plan, context)
         except Exception as error:
@@ -50,13 +65,74 @@ def execute_plan(
                 "tool_name": step.tool_name,
                 "message": step.result_summary,
             }
+            failed_tool = step.tool_name
             break
+        finally:
+            timing_key = _next_timing_key(step.tool_name, execution_timings_ms)
+            execution_timings_ms[timing_key] = max(
+                0.0,
+                (time.perf_counter() - step_start) * 1000,
+            )
 
         step.result_summary = summary
         step.status = StepStatus.COMPLETED
         context[f"{step.tool_name}_result"] = result
+        completed_steps += 1
 
-    return {"plan": execution_plan, "context": context}
+    execution_plan.invoked_tools = invoked_tools
+    trace = _build_execution_trace(
+        execution_plan=execution_plan,
+        invoked_tools=invoked_tools,
+        execution_timings_ms=execution_timings_ms,
+        total_execution_time_ms=max(0.0, (time.perf_counter() - workflow_start) * 1000),
+        completed_steps=completed_steps,
+        failed_tool=failed_tool,
+        error=context.get("error"),
+    )
+
+    return {"plan": execution_plan, "context": context, "trace": trace}
+
+
+def _build_execution_trace(
+    execution_plan: ExecutionPlan,
+    invoked_tools: list[str],
+    execution_timings_ms: dict[str, float],
+    total_execution_time_ms: float,
+    completed_steps: int,
+    failed_tool: str | None,
+    error: dict[str, Any] | None,
+) -> ExecutionTrace:
+    """Build telemetry from actual runtime execution without mutating plan inputs."""
+    if failed_tool is None:
+        status = TraceStatus.SUCCESS
+        error_message = None
+    else:
+        status = TraceStatus.PARTIAL_SUCCESS if completed_steps else TraceStatus.FAILED
+        failure_message = error.get("message", "Execution failed") if error else "Execution failed"
+        error_message = f"{failed_tool}: {failure_message}"
+
+    return ExecutionTrace(
+        query_id=execution_plan.plan_id,
+        detected_intent=execution_plan.detected_intent,
+        active_filters=deepcopy(execution_plan.active_filters),
+        invoked_tools=invoked_tools.copy(),
+        skipped_tools=[tool.model_copy(deep=True) for tool in execution_plan.skipped_tools],
+        execution_timings_ms=execution_timings_ms.copy(),
+        total_execution_time_ms=total_execution_time_ms,
+        status=status,
+        error_message=error_message,
+    )
+
+
+def _next_timing_key(tool_name: str, timings: dict[str, float]) -> str:
+    """Return a stable, non-conflicting timing key for a tool invocation."""
+    if tool_name not in timings:
+        return tool_name
+
+    occurrence = 2
+    while f"{tool_name}#{occurrence}" in timings:
+        occurrence += 1
+    return f"{tool_name}#{occurrence}"
 
 
 def _dispatch_step(
