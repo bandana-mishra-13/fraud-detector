@@ -33,6 +33,7 @@ import { QueryBar } from "@/components/QueryBar";
 import { ResultsTable } from "@/components/ResultsTable";
 import { ExecutionPlanTimeline } from "@/components/ExecutionPlanTimeline";
 import { ExecutiveSummaryCard } from "@/components/ExecutiveSummaryCard";
+import { ExplanationEvidenceDrawer, ExplanationDrawerData } from "@/components/ExplanationEvidenceDrawer";
 import { getMockResponseForQuery } from "@/lib/mockData";
 
 export default function Home() {
@@ -45,6 +46,42 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<"summary" | "plan" | "results" | "trace" | "architecture">("summary");
   const [queryResponse, setQueryResponse] = useState<QueryResponse | null>(null);
   const [lastExecutionMeta, setLastExecutionMeta] = useState<{ isMock: boolean; latencyMs: number } | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerData, setDrawerData] = useState<ExplanationDrawerData | null>(null);
+
+  const openDrawerForFlag = (flag: Flag) => {
+    setDrawerData({
+      flagId: flag.flag_id,
+      ruleId: flag.rule_id,
+      ruleName: flag.rule_name,
+      typology: flag.typology || flag.rule_name,
+      severity: flag.severity,
+      entityId: flag.entity_id,
+      summary: flag.reason,
+      explanation: flag.reason,
+      transactionIds: flag.transaction_ids,
+      evidence: flag.evidence,
+      timestamp: flag.timestamp,
+    });
+    setDrawerOpen(true);
+  };
+
+  const openDrawerForExplanation = (exp: Record<string, any>) => {
+    setDrawerData({
+      flagId: exp.flag_id || `EXP-${Math.random().toString(36).slice(2, 7)}`,
+      ruleId: exp.rule_id || "RULE-DETECTOR",
+      ruleName: exp.rule_name || "AML Typology Rule",
+      typology: exp.typology || "AML Finding",
+      severity: exp.severity || "HIGH",
+      entityId: exp.entity_id,
+      summary: exp.summary,
+      explanation: exp.explanation || exp.summary,
+      transactionIds: exp.transaction_ids || [],
+      evidence: exp.evidence || {},
+      timestamp: exp.timestamp,
+    });
+    setDrawerOpen(true);
+  };
 
   const runHealthCheck = useCallback(async () => {
     setIsRefreshing(true);
@@ -324,14 +361,22 @@ export default function Home() {
                     {queryResponse.explanations && queryResponse.explanations.length > 0 && (
                       <div className="space-y-3">
                         <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
-                          Typology Explainability Breakdowns
+                          Typology Explainability Breakdowns (Dev A Task 2.6 / 4.4)
                         </h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                           {queryResponse.explanations.map((exp, idx) => (
-                            <div key={idx} className="p-4 rounded-xl bg-slate-900/40 border border-white/5 space-y-1.5 text-xs">
+                            <div
+                              key={idx}
+                              onClick={() => openDrawerForExplanation(exp)}
+                              className="p-4 rounded-xl bg-slate-900/40 hover:bg-slate-900/90 border border-white/5 hover:border-sky-500/40 cursor-pointer transition-all space-y-2 text-xs group"
+                            >
                               <div className="flex items-center justify-between">
-                                <span className="font-bold text-sky-400">{exp.typology || "AML Finding"}</span>
-                                <span className="font-mono text-[10px] text-slate-500">{exp.flag_id || `#${idx + 1}`}</span>
+                                <span className="font-bold text-sky-400 group-hover:text-sky-300 transition-colors">
+                                  {exp.typology || "AML Finding"}
+                                </span>
+                                <span className="text-[10px] font-mono text-sky-400 bg-sky-950/60 px-2 py-0.5 rounded border border-sky-500/30">
+                                  Inspect Evidence &rarr;
+                                </span>
                               </div>
                               <p className="text-slate-300 leading-relaxed">{exp.explanation || exp.summary}</p>
                             </div>
@@ -347,9 +392,13 @@ export default function Home() {
                   <ExecutionPlanTimeline plan={queryResponse.execution_plan} trace={queryResponse.trace} />
                 )}
 
-                {/* Tab 3: Flagged Results Table (Task 4.3) */}
+                {/* Tab 3: Flagged Results Table (Task 4.3 & 4.4) */}
                 {activeTab === "results" && (
-                  <ResultsTable flags={queryResponse.flags} queryId={queryResponse.query_id} />
+                  <ResultsTable
+                    flags={queryResponse.flags}
+                    queryId={queryResponse.query_id}
+                    onSelectFlag={openDrawerForFlag}
+                  />
                 )}
 
                 {/* Tab 4: Telemetry & Trace Log */}
@@ -369,8 +418,8 @@ export default function Home() {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
                     {/* Dev A */}
                     <div className="p-4 rounded-xl bg-slate-900/50 border border-purple-500/20 space-y-2">
-                      <div className="text-purple-400 font-bold">Dev A &bull; Agent & Explainability</div>
-                      <p className="text-slate-400">Schemas, EDA profiling, Intent Parser (3.1), LLM Synthesizer (3.4), Typology Explanations (2.6).</p>
+                      <div className="text-purple-400 font-bold">Dev A &bull; Agent & Explainability Lead</div>
+                      <p className="text-slate-400">Schemas, EDA profiling, Intent Parser (3.1), LLM Synthesizer (3.4), Typology Explanations (2.6), Execution Plan Timeline (4.2), Evidence Drawer (4.4).</p>
                     </div>
 
                     {/* Dev B */}
@@ -391,6 +440,13 @@ export default function Home() {
           </section>
         )}
       </main>
+
+      {/* Explanation & Evidence Drawer (Task 4.4) */}
+      <ExplanationEvidenceDrawer
+        isOpen={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        data={drawerData}
+      />
 
       {/* Footer */}
       <footer className="border-t border-white/5 py-4 bg-[#090d16]/80 text-center text-xs text-slate-500">
