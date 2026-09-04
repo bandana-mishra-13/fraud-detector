@@ -35,6 +35,7 @@ import { ExecutionPlanTimeline } from "@/components/ExecutionPlanTimeline";
 import { ExecutiveSummaryCard } from "@/components/ExecutiveSummaryCard";
 import { ExplanationEvidenceDrawer, ExplanationDrawerData } from "@/components/ExplanationEvidenceDrawer";
 import { AnalyticsCharts } from "@/components/AnalyticsCharts";
+import { EntityDrillDown } from "@/components/EntityDrillDown";
 import { getMockResponseForQuery } from "@/lib/mockData";
 
 export default function Home() {
@@ -250,6 +251,17 @@ export default function Home() {
             <AnalyticsCharts
               edaSummary={queryResponse.eda_summary}
               flags={queryResponse.flags}
+            />
+
+            {/* Entity Drill-Down (Task 4.6) */}
+            <EntityDrillDown
+              riskResult={queryResponse.risk_result}
+              flags={queryResponse.flags}
+              executionPlan={queryResponse.execution_plan}
+              parsedIntent={queryResponse.parsed_intent}
+              synthesizedResult={queryResponse.synthesized_result}
+              edaSummary={queryResponse.eda_summary}
+              onSelectFlag={openDrawerForFlag}
             />
 
             {/* Tab Navigation */}
