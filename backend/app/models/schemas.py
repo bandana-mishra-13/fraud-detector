@@ -29,6 +29,41 @@ class TraceStatus(str, Enum):
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
 
 
+class IntentType(str, Enum):
+    """Categorized intent type for AML user queries."""
+    BROAD_ANALYSIS = "broad_analysis"
+    PATTERN_DETECTION = "pattern_detection"
+    AGGREGATION = "aggregation"
+    ENTITY_INVESTIGATION = "entity_investigation"
+    UNSUPPORTED = "unsupported"
+
+
+class TimeWindowSpec(BaseModel):
+    """Structured temporal constraint parsed from query."""
+    type: Optional[str] = Field(default=None, description="Type of time window (relative, absolute, range)")
+    value: Optional[int] = Field(default=None, description="Numeric time quantity (e.g., 30)")
+    unit: Optional[str] = Field(default=None, description="Time unit (days, hours, weeks, months)")
+    start_date: Optional[str] = Field(default=None, description="Explicit start date if provided")
+    end_date: Optional[str] = Field(default=None, description="Explicit end date if provided")
+    raw_text: Optional[str] = Field(default=None, description="Raw natural language text (e.g., 'last 30 days')")
+
+
+class ParsedIntent(BaseModel):
+    """
+    Validated structured representation of a natural language AML query.
+    Used by downstream Dynamic Planner to build execution plans.
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+    query: str = Field(..., description="Original raw user query")
+    intent: IntentType = Field(..., description="Categorized query intent")
+    filters: Dict[str, Any] = Field(default_factory=dict, description="Structured numerical or categorical filters")
+    entities: List[str] = Field(default_factory=list, description="Extracted entity/account identifiers")
+    pattern: Optional[str] = Field(default=None, description="Canonical AML typology pattern name if specified")
+    time_window: Optional[TimeWindowSpec] = Field(default=None, description="Parsed temporal constraint if specified")
+    raw_llm_response: Optional[str] = Field(default=None, description="Raw LLM JSON response for debugging/auditing")
+
+
 def generate_uuid() -> str:
     """Utility to generate a string UUID4."""
     return str(uuid.uuid4())
