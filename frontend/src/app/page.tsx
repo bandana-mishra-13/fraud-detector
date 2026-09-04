@@ -344,7 +344,7 @@ export default function Home() {
 
                 {/* Tab 2: Execution Plan (Task 4.2 / Task 3.2) */}
                 {activeTab === "plan" && (
-                  <ExecutionPlanTimeline plan={queryResponse.execution_plan} />
+                  <ExecutionPlanTimeline plan={queryResponse.execution_plan} trace={queryResponse.trace} />
                 )}
 
                 {/* Tab 3: Flagged Results Table (Task 4.3) */}
