@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.api.health import router as health_router
+from app.storage import get_audit_store
 
 
 @asynccontextmanager
@@ -12,6 +13,9 @@ async def lifespan(app: FastAPI):
     # Ensure local data and storage directories exist on startup
     os.makedirs(settings.DATA_DIR, exist_ok=True)
     os.makedirs(settings.STORAGE_DIR, exist_ok=True)
+    # Initialize SQLite audit database schema and tables
+    audit_store = get_audit_store()
+    audit_store.init_db()
     yield
 
 
