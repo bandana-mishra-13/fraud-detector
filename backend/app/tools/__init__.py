@@ -9,6 +9,13 @@ from app.tools.detectors import (
     detect_structuring,
     run_rule_detectors,
 )
+from app.tools.eda import (
+    get_base_rate_stats,
+    get_eda_profile,
+    get_top_counterparties,
+    get_volume_distribution,
+    run_eda,
+)
 from app.tools.risk import (
     calculate_rule_score,
     determine_risk_tier,
@@ -22,6 +29,11 @@ from app.tools.sampler import sample_transactions
 __all__ = [
     "load_transactions",
     "sample_transactions",
+    "get_eda_profile",
+    "get_volume_distribution",
+    "get_base_rate_stats",
+    "get_top_counterparties",
+    "run_eda",
     "detect_structuring",
     "detect_smurfing",
     "detect_rapid_layering",
