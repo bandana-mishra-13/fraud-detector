@@ -1,82 +1,60 @@
 import pandas as pd
-import pandas.testing as pdt
-import pytest
 
-from app.tools.data_loader import load_transactions
-from app.tools.sampler import sample_transactions
+from app.data.sampler import _account_selected, build_sample
 
 
-@pytest.fixture
-def transactions() -> pd.DataFrame:
-    return load_transactions("synthetic_transactions.csv")
-
-
-def test_retains_all_laundering_rows_and_samples_requested_normals(transactions):
-    sampled = sample_transactions(transactions, normal_sample_size=4)
-
-    expected_laundering = transactions.loc[
-        transactions["Is Laundering"] == 1
-    ].reset_index(drop=True)
-    sampled_laundering = sampled.loc[sampled["Is Laundering"] == 1].reset_index(drop=True)
-
-    pdt.assert_frame_equal(sampled_laundering, expected_laundering)
-    assert (sampled["Is Laundering"] == 0).sum() == 4
-    assert len(sampled) == len(expected_laundering) + 4
-    assert sampled.index.is_unique
-
-
-def test_same_random_state_produces_identical_samples(transactions):
-    first = sample_transactions(transactions, normal_sample_size=5, random_state=7)
-    second = sample_transactions(transactions, normal_sample_size=5, random_state=7)
-
-    pdt.assert_frame_equal(first, second)
-
-
-def test_different_random_states_can_produce_different_normal_samples(transactions):
-    first = sample_transactions(transactions, normal_sample_size=5, random_state=1)
-    second = sample_transactions(transactions, normal_sample_size=5, random_state=2)
-
-    first_normals = first.loc[first["Is Laundering"] == 0, "From Account"].sort_values()
-    second_normals = second.loc[second["Is Laundering"] == 0, "From Account"].sort_values()
-
-    assert not first_normals.reset_index(drop=True).equals(
-        second_normals.reset_index(drop=True)
+def _frame() -> pd.DataFrame:
+    rows = [
+        # a laundering pair — every row touching A1/A2 must survive sampling
+        ("2022-09-01 10:00", "010", "A1", "020", "A2", 9500.0, 1),
+        ("2022-09-02 11:00", "010", "A1", "030", "B7", 120.0, 0),
+        ("2022-09-03 12:00", "040", "C3", "020", "A2", 45.0, 0),
+        # clean-only accounts
+        ("2022-09-04 13:00", "050", "D4", "060", "E5", 300.0, 0),
+        ("2022-09-05 14:00", "060", "E5", "050", "D4", 310.0, 0),
+        ("2022-09-06 15:00", "070", "F6", "080", "G7", 77.0, 0),
+    ]
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "timestamp",
+            "from_bank",
+            "from_account",
+            "to_bank",
+            "to_account",
+            "amount_paid",
+            "is_laundering",
+        ],
     )
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
 
 
-def test_requesting_more_normals_than_available_returns_all_normals(transactions):
-    sampled = sample_transactions(transactions, normal_sample_size=10_000)
-
-    assert len(sampled) == len(transactions)
-    assert (sampled["Is Laundering"] == 0).sum() == (
-        transactions["Is Laundering"] == 0
-    ).sum()
+def test_account_selection_is_deterministic():
+    for account in ("A1", "B7", "8000EBD30"):
+        assert _account_selected(account, 0.5) == _account_selected(account, 0.5)
 
 
-def test_zero_normal_sample_size_returns_only_laundering_rows(transactions):
-    sampled = sample_transactions(transactions, normal_sample_size=0)
-
-    assert len(sampled) == (transactions["Is Laundering"] == 1).sum()
-    assert sampled["Is Laundering"].eq(1).all()
+def test_fraction_bounds():
+    assert not _account_selected("ANY", 0.0)
+    assert _account_selected("ANY", 1.0)
 
 
-def test_negative_normal_sample_size_raises_value_error(transactions):
-    with pytest.raises(ValueError, match="normal_sample_size must be non-negative"):
-        sample_transactions(transactions, normal_sample_size=-1)
+def test_laundering_context_always_survives():
+    sample = build_sample(_frame(), fraction=0.0)
+    # rows touching laundering-involved accounts (A1, A2) survive even at 0%
+    assert set(sample["from_account"]) | set(sample["to_account"]) >= {"A1", "A2"}
+    assert (sample["is_laundering"] == 1).sum() == 1
+    # fully clean accounts are gone at fraction 0
+    assert "F6" not in set(sample["from_account"])
 
 
-def test_missing_laundering_column_raises_value_error(transactions):
-    without_label = transactions.drop(columns="Is Laundering")
+def test_sampling_is_reproducible():
+    a = build_sample(_frame(), fraction=0.5)
+    b = build_sample(_frame(), fraction=0.5)
+    pd.testing.assert_frame_equal(a, b)
 
-    with pytest.raises(ValueError, match="missing 'Is Laundering'"):
-        sample_transactions(without_label, normal_sample_size=2)
 
-
-def test_input_columns_and_dtypes_are_preserved_without_mutation(transactions):
-    original = transactions.copy(deep=True)
-
-    sampled = sample_transactions(transactions, normal_sample_size=3)
-
-    pdt.assert_frame_equal(transactions, original)
-    assert sampled.columns.equals(transactions.columns)
-    assert sampled.dtypes.equals(transactions.dtypes)
+def test_full_fraction_keeps_everything():
+    df = _frame()
+    assert len(build_sample(df, fraction=1.0)) == len(df)

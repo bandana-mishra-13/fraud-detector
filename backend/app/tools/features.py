@@ -1,208 +1,158 @@
-"""Deterministic transaction features for AML rules and anomaly models."""
+"""Feature Engineering Tool — account-level AML behaviour features.
 
-from collections import Counter, deque
-from typing import Final
+Built on demand for the slice the query selected. Produces exactly the
+feature families the problem statement names: transaction frequency, rolling
+sums, amount deviation, velocity, and rapid cash-out — plus fan-in/fan-out
+degrees and sub-threshold (structuring) counts.
 
+The ground-truth `is_laundering` label is deliberately NEVER used here:
+detection must stand on behaviour alone; labels are only for validation.
+"""
+
+import numpy as np
 import pandas as pd
 
+CTR_THRESHOLD = 10_000.0  # the reporting threshold structurers stay under
+SUB_BAND_LOW = 8_500.0    # "just under" band: [8500, 10000)
+PASS_WINDOW = pd.Timedelta("24h")
 
-REQUIRED_FEATURE_COLUMNS: Final = (
-    "Timestamp",
-    "From Account",
-    "To Account",
-    "Amount Paid",
-    "Amount Received",
-)
-FEATURE_COLUMNS: Final = (
-    "outbound_rolling_amount_sum",
-    "inbound_rolling_amount_sum",
-    "outbound_rolling_transaction_count",
-    "inbound_rolling_transaction_count",
-    "outbound_rolling_sub_threshold_count",
-    "inbound_rolling_sub_threshold_count",
-    "outbound_amount_deviation_from_mean",
-    "inbound_amount_deviation_from_mean",
-    "outbound_rolling_fan_out_count",
-    "inbound_rolling_fan_in_count",
-)
-_FEATURE_DTYPES: Final = {
-    "outbound_rolling_amount_sum": "float64",
-    "inbound_rolling_amount_sum": "float64",
-    "outbound_rolling_transaction_count": "int64",
-    "inbound_rolling_transaction_count": "int64",
-    "outbound_rolling_sub_threshold_count": "int64",
-    "inbound_rolling_sub_threshold_count": "int64",
-    "outbound_amount_deviation_from_mean": "float64",
-    "inbound_amount_deviation_from_mean": "float64",
-    "outbound_rolling_fan_out_count": "int64",
-    "inbound_rolling_fan_in_count": "int64",
-}
+FEATURE_COLUMNS = [
+    "out_count", "out_total", "out_mean", "out_std", "out_max", "fan_out",
+    "in_count", "in_total", "fan_in", "sub10k_out_count", "sub10k_out_total",
+    "sub10k_in_count", "sub10k_in_senders", "max_txns_24h", "max_sum_72h",
+    "quick_out_total", "cash_quick_out_total", "passthrough_24h_ratio",
+    "cash_out_24h_ratio", "amount_z"
+]
 
 
-def engineer_features(
-    transactions: pd.DataFrame,
-    window: str | pd.Timedelta = "24h",
-    sub_threshold: float = 10_000.0,
-) -> pd.DataFrame:
-    """Add rolling transaction features without modifying ``transactions``.
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Return one row of behaviour features per account."""
+    # 0. ZERO-ROW SAFETY NET (Prevents rolling/merge crashes on empty filters)
+    if df.empty:
+        empty_df = pd.DataFrame(columns=FEATURE_COLUMNS, dtype=float)
+        empty_df.index.name = "account"
+        return empty_df
 
-    Windows include the current transaction and earlier transactions in the
-    same account stream. Deviation is measured against the preceding rolling
-    mean, using ``0.0`` where no earlier transaction is available.
-    """
-    _validate_required_columns(transactions)
-    rolling_window = _parse_window(window)
-    if sub_threshold < 0:
-        raise ValueError("sub_threshold must be non-negative")
+    out_g = df.groupby("from_account", observed=True)
+    in_g = df.groupby("to_account", observed=True)
 
-    featured = transactions.copy(deep=True)
-    featured["Timestamp"] = pd.to_datetime(featured["Timestamp"], errors="raise")
-    if featured["Timestamp"].isna().any():
-        raise ValueError("Timestamp contains missing values")
-
-    featured["Amount Paid"] = pd.to_numeric(featured["Amount Paid"], errors="raise")
-    featured["Amount Received"] = pd.to_numeric(
-        featured["Amount Received"],
-        errors="raise",
+    feats = pd.DataFrame(
+        {
+            "out_count": out_g.size(),
+            "out_total": out_g["amount_paid"].sum(),
+            "out_mean": out_g["amount_paid"].mean(),
+            "out_std": out_g["amount_paid"].std(),
+            "out_max": out_g["amount_paid"].max(),
+            "fan_out": out_g["to_account"].nunique(),
+        }
     )
-    if featured[["Amount Paid", "Amount Received"]].isna().any().any():
-        raise ValueError("Amount Paid and Amount Received must not contain missing values")
-
-    featured["_feature_position"] = range(len(featured))
-    featured = featured.sort_values(
-        ["Timestamp", "_feature_position"],
-        kind="stable",
+    feats = feats.join(
+        pd.DataFrame(
+            {
+                "in_count": in_g.size(),
+                "in_total": in_g["amount_paid"].sum(),
+                "fan_in": in_g["from_account"].nunique(),
+            }
+        ),
+        how="outer",
     )
 
-    outbound = _calculate_directional_features(
-        featured,
-        account_column="From Account",
-        counterparty_column="To Account",
-        amount_column="Amount Paid",
-        prefix="outbound",
-        window=rolling_window,
-        sub_threshold=sub_threshold,
-    )
-    inbound = _calculate_directional_features(
-        featured,
-        account_column="To Account",
-        counterparty_column="From Account",
-        amount_column="Amount Received",
-        prefix="inbound",
-        window=rolling_window,
-        sub_threshold=sub_threshold,
-    )
-
-    feature_values = {**outbound, **inbound}
-    for feature_name in FEATURE_COLUMNS:
-        values = feature_values[feature_name]
-        ordered_values = [values[position] for position in featured["_feature_position"]]
-        featured[feature_name] = pd.Series(
-            ordered_values,
-            index=featured.index,
-            dtype=_FEATURE_DTYPES[feature_name],
-        )
-
-    return featured.sort_values("_feature_position", kind="stable").drop(
-        columns="_feature_position"
-    )
-
-
-def _validate_required_columns(transactions: pd.DataFrame) -> None:
-    missing_columns = [
-        column for column in REQUIRED_FEATURE_COLUMNS if column not in transactions.columns
+    # ── sub-threshold (structuring / smurfing) counts ─────────────────────
+    sub = df[
+        (df["amount_paid"] >= SUB_BAND_LOW) & (df["amount_paid"] < CTR_THRESHOLD)
     ]
-    if missing_columns:
-        raise ValueError(
-            "Transaction DataFrame is missing required columns: "
-            + ", ".join(missing_columns)
+    feats = feats.join(
+        sub.groupby("from_account", observed=True)["amount_paid"]
+        .agg(sub10k_out_count="count", sub10k_out_total="sum"),
+        how="left",
+    )
+    sub_in = sub.groupby("to_account", observed=True)
+    feats = feats.join(
+        pd.DataFrame(
+            {
+                "sub10k_in_count": sub_in.size(),
+                "sub10k_in_senders": sub_in["from_account"].nunique(),
+            }
+        ),
+        how="left",
+    )
+
+    # ── velocity & rolling sums (time-windowed, per account) ─────────────
+    ordered = df.sort_values(["from_account", "timestamp"])
+    
+    # 24h rolling transaction counts (Simplified index grouping)
+    rolled24 = ordered.groupby("from_account", observed=True).rolling(
+        "24h", on="timestamp"
+    )["amount_paid"]
+    max_txns_24h = rolled24.count().groupby("from_account", observed=True).max().rename("max_txns_24h")
+    feats = feats.join(max_txns_24h, how="left")
+
+    # 72h rolling transaction sums (Simplified index grouping)
+    rolled72 = ordered.groupby("from_account", observed=True).rolling(
+        "72h", on="timestamp"
+    )["amount_paid"]
+    max_sum_72h = rolled72.sum().groupby("from_account", observed=True).max().rename("max_sum_72h")
+    feats = feats.join(max_sum_72h, how="left")
+
+    # ── pass-through & rapid cash-out ─────────────────────────────────────
+    # Force account to str to avoid categorical dtype mismatch in merge_asof
+    inflows = (
+        df[["to_account", "timestamp"]]
+        .rename(columns={"to_account": "account"})
+        .assign(account=lambda x: x["account"].astype(str))
+        .sort_values("timestamp")
+    )
+    outflows = (
+        df[["from_account", "timestamp", "amount_paid", "payment_format"]]
+        .rename(columns={"from_account": "account"})
+        .assign(account=lambda x: x["account"].astype(str))
+        .sort_values("timestamp")
+    )
+    
+    matched = pd.merge_asof(
+        outflows,
+        inflows.assign(inflow_ts=inflows["timestamp"]),
+        on="timestamp",
+        by="account",
+        direction="backward",
+    )
+    gap = matched["timestamp"] - matched["inflow_ts"]
+    matched["quick"] = gap.notna() & (gap <= PASS_WINDOW)
+    
+    quick_out = (
+        matched[matched["quick"]]
+        .groupby("account", observed=True)["amount_paid"]
+        .sum()
+        .rename("quick_out_total")
+    )
+    cash_quick_out = (
+        matched[matched["quick"] & (matched["payment_format"] == "Cash")]
+        .groupby("account", observed=True)["amount_paid"]
+        .sum()
+        .rename("cash_quick_out_total")
+    )
+    feats = feats.join(quick_out, how="left").join(cash_quick_out, how="left")
+
+    # ── ratios and amount deviation ───────────────────────────────────────
+    with np.errstate(divide="ignore", invalid="ignore"):
+        feats["passthrough_24h_ratio"] = np.clip(
+            np.where(feats["in_total"] > 0, feats["quick_out_total"] / feats["in_total"], 0.0),
+            0.0,
+            1.0,
+        )
+        feats["cash_out_24h_ratio"] = np.clip(
+            np.where(feats["in_total"] > 0, feats["cash_quick_out_total"] / feats["in_total"], 0.0),
+            0.0,
+            1.0,
+        )
+        # amount deviation: how far the account's largest payment sits from typical behaviour
+        feats["amount_z"] = np.where(
+            feats["out_std"] > 0,
+            (feats["out_max"] - feats["out_mean"]) / feats["out_std"],
+            0.0,
         )
 
-
-def _parse_window(window: str | pd.Timedelta) -> pd.Timedelta:
-    try:
-        parsed_window = pd.Timedelta(window)
-    except (TypeError, ValueError) as error:
-        raise ValueError("window must be a valid positive pandas timedelta") from error
-
-    if parsed_window <= pd.Timedelta(0):
-        raise ValueError("window must be a positive pandas timedelta")
-    return parsed_window
-
-
-def _calculate_directional_features(
-    transactions: pd.DataFrame,
-    *,
-    account_column: str,
-    counterparty_column: str,
-    amount_column: str,
-    prefix: str,
-    window: pd.Timedelta,
-    sub_threshold: float,
-) -> dict[str, list[float | int]]:
-    amount_sums = [0.0] * len(transactions)
-    transaction_counts = [0] * len(transactions)
-    sub_threshold_counts = [0] * len(transactions)
-    deviations = [0.0] * len(transactions)
-    distinct_counterparty_counts = [0] * len(transactions)
-
-    for _, account_transactions in transactions.groupby(
-        account_column,
-        sort=False,
-        dropna=False,
-    ):
-        rolling_rows: deque[tuple[pd.Timestamp, float, bool, object]] = deque()
-        counterparties: Counter[object] = Counter()
-        rolling_sum = 0.0
-        rolling_count = 0
-        rolling_sub_threshold_count = 0
-
-        selected_columns = [
-            "_feature_position",
-            "Timestamp",
-            amount_column,
-            counterparty_column,
-        ]
-        for position, timestamp, amount, counterparty in account_transactions[
-            selected_columns
-        ].itertuples(index=False, name=None):
-            cutoff = timestamp - window
-            while rolling_rows and rolling_rows[0][0] < cutoff:
-                _, expired_amount, expired_is_sub_threshold, expired_counterparty = (
-                    rolling_rows.popleft()
-                )
-                rolling_sum -= expired_amount
-                rolling_count -= 1
-                rolling_sub_threshold_count -= int(expired_is_sub_threshold)
-                counterparties[expired_counterparty] -= 1
-                if counterparties[expired_counterparty] == 0:
-                    del counterparties[expired_counterparty]
-
-            numeric_amount = float(amount)
-            prior_mean = rolling_sum / rolling_count if rolling_count else 0.0
-            is_sub_threshold = numeric_amount < sub_threshold
-            counterparty_key = None if pd.isna(counterparty) else counterparty
-
-            rolling_rows.append(
-                (timestamp, numeric_amount, is_sub_threshold, counterparty_key)
-            )
-            rolling_sum += numeric_amount
-            rolling_count += 1
-            rolling_sub_threshold_count += int(is_sub_threshold)
-            counterparties[counterparty_key] += 1
-
-            row_position = int(position)
-            amount_sums[row_position] = rolling_sum
-            transaction_counts[row_position] = rolling_count
-            sub_threshold_counts[row_position] = rolling_sub_threshold_count
-            deviations[row_position] = numeric_amount - prior_mean if rolling_count > 1 else 0.0
-            distinct_counterparty_counts[row_position] = len(counterparties)
-
-    counterpart_feature = "fan_out" if prefix == "outbound" else "fan_in"
-    return {
-        f"{prefix}_rolling_amount_sum": amount_sums,
-        f"{prefix}_rolling_transaction_count": transaction_counts,
-        f"{prefix}_rolling_sub_threshold_count": sub_threshold_counts,
-        f"{prefix}_amount_deviation_from_mean": deviations,
-        f"{prefix}_rolling_{counterpart_feature}_count": distinct_counterparty_counts,
-    }
+    # FINAL CLEANUP: Replaces any div-by-zero infs or missing NaNs at the VERY END
+    feats = feats.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    feats.index.name = "account"
+    return feats

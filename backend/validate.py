@@ -1,203 +1,110 @@
-"""Evaluate the Isolation Forest AML detector against IBM ``Is Laundering`` labels.
+"""Validate Argus detectors against IBM's labeled laundering attempts.
 
-Run from the backend directory:
-    python validate.py
-    python validate.py --dataset data/synthetic_transactions.csv
+Parses HI-Small_Patterns.txt (370 labeled typology attempts), runs the full
+hybrid detection stack on the analysis sample, and reports:
 
-This validates the transaction-level ML detector only. Deterministic rule flags
-are entity/group findings and do not have a stable row-level mapping when the
-source CSV has no transaction identifier.
+- per-typology attempt detection rate (≥1 involved account flagged)
+- precision@K against label-involved accounts
+- flag volume (false-positive pressure)
+
+Usage:
+  .venv/bin/python validate.py             # current DEFAULT_THRESHOLDS
+  .venv/bin/python validate.py --candidate # candidate threshold set
 """
 
-from __future__ import annotations
+import re
+import sys
+from collections import defaultdict
 
-import argparse
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Sequence
+from app.config import settings
+from app.data.loader import load_sample
+from app.tools.detectors import DEFAULT_THRESHOLDS, run_isolation_forest, run_rules
+from app.tools.features import build_features
+from app.tools.risk import classify
 
-import numpy as np
-import pandas as pd
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
+CANDIDATE_THRESHOLDS = {
+    # loosen smurfing (0 hits at baseline on real data)
+    "smurfing_min_txns": 5,
+    "smurfing_min_senders": 3,
+    # tighten the noisy rules — moderate point between baseline and the
+    # aggressive first candidate (which cost 4pts of typology coverage)
+    "layering_min_volume": 75_000.0,
+    "layering_min_passthrough": 0.82,
+    "cashout_min_ratio": 0.55,
+    "cashout_min_inflow": 30_000.0,
+    "velocity_min_txns_24h": 30,
+}
 
-from app.tools.data_loader import DEFAULT_DATASET_NAME, load_transactions
-from app.tools.features import engineer_features
-from app.tools.isolation_forest import IS_ANOMALY_COLUMN, detect_anomalies
-
-
-GROUND_TRUTH_COLUMN = "Is Laundering"
-
-
-@dataclass(frozen=True)
-class ValidationMetrics:
-    """Transaction-level detector metrics against IBM AML ground-truth labels."""
-
-    precision: float
-    recall: float
-    f1_score: float
-    true_positives: int
-    false_positives: int
-    true_negatives: int
-    false_negatives: int
-    total_rows: int
-    actual_positives: int
-    predicted_positives: int
+FAMILY_RE = re.compile(r"BEGIN LAUNDERING ATTEMPT - ([A-Z-]+)")
 
 
-def get_ground_truth_labels(transactions: pd.DataFrame) -> pd.Series:
-    """Return validated binary IBM AML labels without changing the input frame."""
-    if transactions.empty:
-        raise ValueError("Transaction DataFrame is empty; no rows are available for validation")
-    if GROUND_TRUTH_COLUMN not in transactions.columns:
-        raise ValueError(
-            f"Transaction DataFrame is missing ground-truth column '{GROUND_TRUTH_COLUMN}'"
-        )
-
-    labels = pd.to_numeric(transactions[GROUND_TRUTH_COLUMN], errors="coerce")
-    if labels.isna().any() or not labels.isin([0, 1]).all():
-        raise ValueError(f"{GROUND_TRUTH_COLUMN} must contain only binary 0/1 values")
-    return labels.astype("int64")
-
-
-def calculate_metrics(
-    ground_truth: Sequence[int] | pd.Series | np.ndarray,
-    predictions: Sequence[int] | pd.Series | np.ndarray,
-) -> ValidationMetrics:
-    """Calculate reproducible binary classification metrics using sklearn."""
-    truth = _validate_binary_array(ground_truth, "Ground-truth labels")
-    predicted = _validate_binary_array(predictions, "Predictions")
-    if len(truth) == 0:
-        raise ValueError("No rows are available for validation")
-    if len(truth) != len(predicted):
-        raise ValueError("Ground-truth labels and predictions must have the same length")
-
-    true_negatives, false_positives, false_negatives, true_positives = (
-        confusion_matrix(truth, predicted, labels=[0, 1]).ravel()
-    )
-    return ValidationMetrics(
-        precision=float(precision_score(truth, predicted, zero_division=0)),
-        recall=float(recall_score(truth, predicted, zero_division=0)),
-        f1_score=float(f1_score(truth, predicted, zero_division=0)),
-        true_positives=int(true_positives),
-        false_positives=int(false_positives),
-        true_negatives=int(true_negatives),
-        false_negatives=int(false_negatives),
-        total_rows=len(truth),
-        actual_positives=int(truth.sum()),
-        predicted_positives=int(predicted.sum()),
-    )
-
-
-def evaluate_transactions(
-    transactions: pd.DataFrame,
-    contamination: float = 0.05,
-    random_state: int = 42,
-) -> ValidationMetrics:
-    """Evaluate existing feature engineering and Isolation Forest predictions.
-
-    The label column is read only for final metric comparison. The detector
-    receives engineered features exclusively through ``detect_anomalies``.
-    """
-    ground_truth = get_ground_truth_labels(transactions)
-    featured_transactions = engineer_features(transactions)
-    scored_transactions = detect_anomalies(
-        featured_transactions,
-        contamination=contamination,
-        random_state=random_state,
-    )
-    if IS_ANOMALY_COLUMN not in scored_transactions.columns:
-        raise ValueError(f"Detector output is missing '{IS_ANOMALY_COLUMN}'")
-
-    return calculate_metrics(ground_truth, scored_transactions[IS_ANOMALY_COLUMN])
-
-
-def evaluate_dataset(
-    dataset: str | Path | None = None,
-    contamination: float = 0.05,
-    random_state: int = 42,
-) -> ValidationMetrics:
-    """Load a configured AML CSV and evaluate its transaction-level ML output."""
-    return evaluate_transactions(
-        load_transactions(dataset),
-        contamination=contamination,
-        random_state=random_state,
-    )
-
-
-def format_validation_report(metrics: ValidationMetrics, dataset: str | Path | None) -> str:
-    """Return a concise, human-readable validation report."""
-    dataset_name = str(dataset) if dataset is not None else DEFAULT_DATASET_NAME
-    return "\n".join(
-        [
-            "Argus AML Validation (ML-only)",
-            "-------------------------------",
-            f"Dataset: {dataset_name}",
-            f"Rows evaluated: {metrics.total_rows}",
-            f"Ground-truth positives: {metrics.actual_positives}",
-            f"Predicted positives: {metrics.predicted_positives}",
-            "",
-            "Confusion Matrix",
-            f"TP: {metrics.true_positives}",
-            f"FP: {metrics.false_positives}",
-            f"TN: {metrics.true_negatives}",
-            f"FN: {metrics.false_negatives}",
-            "",
-            "Metrics",
-            f"Precision: {metrics.precision:.4f}",
-            f"Recall:    {metrics.recall:.4f}",
-            f"F1 Score:  {metrics.f1_score:.4f}",
-        ]
-    )
-
-
-def _validate_binary_array(
-    values: Sequence[int] | pd.Series | np.ndarray,
-    name: str,
-) -> np.ndarray:
-    array = np.asarray(values)
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional")
-
-    numeric_values = pd.to_numeric(pd.Series(array), errors="coerce")
-    if numeric_values.isna().any() or not numeric_values.isin([0, 1]).all():
-        raise ValueError(f"{name} must contain only binary 0/1 values")
-    return numeric_values.to_numpy(dtype="int64")
+def parse_patterns(path) -> list[tuple[str, set[str]]]:
+    """→ [(family, involved_accounts), ...] for each labeled attempt."""
+    attempts = []
+    family, accounts = None, set()
+    with open(path) as fh:
+        for line in fh:
+            m = FAMILY_RE.search(line)
+            if m:
+                family, accounts = m.group(1), set()
+            elif line.startswith("END LAUNDERING ATTEMPT"):
+                if family and accounts:
+                    attempts.append((family, accounts))
+                family = None
+            elif family and "," in line:
+                parts = line.split(",")
+                if len(parts) >= 5:
+                    accounts.add(parts[2])
+                    accounts.add(parts[4])
+    return attempts
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Evaluate the Argus AML Isolation Forest against IBM AML labels.",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        default=None,
-        help="CSV path or filename. Defaults to the configured HI-Small_Trans.csv dataset.",
-    )
-    parser.add_argument(
-        "--contamination",
-        type=float,
-        default=0.05,
-        help="Isolation Forest contamination in (0, 0.5]. Default: 0.05.",
-    )
-    parser.add_argument(
-        "--random-state",
-        type=int,
-        default=42,
-        help="Isolation Forest random seed. Default: 42.",
-    )
-    args = parser.parse_args()
+    use_candidate = "--candidate" in sys.argv
+    thresholds = {**DEFAULT_THRESHOLDS, **CANDIDATE_THRESHOLDS} if use_candidate else None
+    label = "CANDIDATE" if use_candidate else "BASELINE (DEFAULT_THRESHOLDS)"
 
-    try:
-        metrics = evaluate_dataset(
-            dataset=args.dataset,
-            contamination=args.contamination,
-            random_state=args.random_state,
-        )
-    except (FileNotFoundError, ValueError) as error:
-        parser.error(str(error))
+    patterns_path = settings.patterns_path
+    attempts = parse_patterns(patterns_path)
+    print(f"labeled attempts: {len(attempts)}\n")
 
-    print(format_validation_report(metrics, args.dataset))
+    df = load_sample()
+    feats = build_features(df)
+    signals = run_rules(df, feats, thresholds=thresholds)
+    ml = run_isolation_forest(feats)
+    flags = classify(signals, ml, top_n=100_000)
+
+    flagged = {f.entity_id for f in flags}
+    flag_order = [f.entity_id for f in flags]  # strongest first
+
+    hot = set()
+    for _, accts in attempts:
+        hot |= accts
+
+    # per-typology attempt detection rate
+    per_family: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for family, accts in attempts:
+        per_family[family][1] += 1
+        if accts & flagged:
+            per_family[family][0] += 1
+
+    print(f"== {label} ==")
+    print(f"total flags: {len(flags):,}  ({len(flagged):,} accounts)")
+    for k in (50, 100):
+        top = flag_order[:k]
+        hits = sum(1 for a in top if a in hot)
+        print(f"precision@{k} vs attempt-involved accounts: {hits}/{k} = {hits / k:.0%}")
+    caught = sum(v[0] for v in per_family.values())
+    total = sum(v[1] for v in per_family.values())
+    print(f"attempts with >=1 flagged account: {caught}/{total} = {caught / total:.0%}\n")
+    print(f"{'typology':<16}{'caught':>8}{'total':>8}{'rate':>8}")
+    for family in sorted(per_family):
+        c, t = per_family[family]
+        print(f"{family:<16}{c:>8}{t:>8}{c / t:>8.0%}")
+
+    from collections import Counter
+
+    print("\nflag volume by pattern:", dict(Counter(f.pattern.value for f in flags)))
 
 
 if __name__ == "__main__":

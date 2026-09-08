@@ -1,278 +1,193 @@
-"""Sequential execution of planner-generated AML investigation plans."""
+"""Executor: run the planned steps, collect results, record the trace.
 
-from copy import deepcopy
+Deterministic by construction — the LLM chose WHAT to run (via the spec);
+here only tools run. Same spec + same data → same flags, always.
+"""
+
 import time
-from typing import Any, Final
+from collections import Counter
 
-import numpy as np
 import pandas as pd
 
-from app.models.schemas import (
-    ExecutionPlan,
-    ExecutionTrace,
-    PlanStep,
-    StepStatus,
-    TraceStatus,
-)
-from app.tools.detectors import run_rule_detectors
-from app.tools.eda import run_eda
-from app.tools.explain import explain_flags
-from app.tools.features import FEATURE_COLUMNS, engineer_features
-from app.tools.isolation_forest import detect_anomalies
-from app.tools.risk import fuse_entity_risk, fuse_overall_risk
+from ..data.loader import load_accounts, load_sample
+from ..models.schemas import ExecutionPlan, Flag, PlanStep, QueryFilters, RiskResult
+from ..store.audit import flags_for_entity, record_run
+from ..tools.detectors import population_anomaly_scores, run_rules
+from ..tools.eda import run_eda
+from ..tools.features import build_features
+from ..tools.filters import apply_filters, resolve_customer_accounts
+from ..tools.risk import classify
+from .intent import IntentSpec
+from .planner import PlannedStep
 
 
-RAW_TRANSACTIONS: Final = "raw_transactions"
-CURRENT_TRANSACTIONS: Final = "current_transactions"
+AGGREGATION_DISPLAY_LIMIT = 250
 
 
-def execute_plan(
-    plan: ExecutionPlan,
-    transactions: pd.DataFrame,
-) -> dict[str, Any]:
-    """Execute a copy of ``plan`` sequentially and return it with its context.
+def _aggregation(
+    df: pd.DataFrame, accounts: pd.DataFrame, params: dict
+) -> tuple[list[dict], int]:
+    """Direct threshold aggregation: accounts with >= N txns under $X.
 
-    Execution stops after the first failed step. The returned context records
-    failure details, while the caller's plan and DataFrame remain unchanged.
+    Returns (rows_for_display, total_matches) — the total is the honest answer
+    to "how many customers match", independent of the display cap.
     """
-    workflow_start = time.perf_counter()
-    execution_plan = plan.model_copy(deep=True)
-    execution_plan.steps = sorted(
-        execution_plan.steps,
-        key=lambda step: step.step_number,
+    scope = df
+    if params.get("max_amount"):
+        scope = scope[scope["amount_paid"] < params["max_amount"]]
+    if params.get("min_amount"):
+        scope = scope[scope["amount_paid"] >= params["min_amount"]]
+    grouped = (
+        scope.groupby("from_account", observed=True)["amount_paid"]
+        .agg(txn_count="count", total="sum")
+        .reset_index()
     )
-    raw_transactions = transactions.copy(deep=True)
-    context: dict[str, Any] = {
-        RAW_TRANSACTIONS: raw_transactions,
-        CURRENT_TRANSACTIONS: raw_transactions,
+    hits = grouped[grouped["txn_count"] >= params.get("min_txn_count", 10)]
+    total = int(len(hits))
+    hits = hits.nlargest(AGGREGATION_DISPLAY_LIMIT, "txn_count")
+    directory = accounts.set_index("account")["entity_name"]
+    rows = [
+        {
+            "account": str(r.from_account),
+            "customer": str(directory.get(r.from_account, "unknown")),
+            "txn_count": int(r.txn_count),
+            "total": round(float(r.total), 2),
+        }
+        for r in hits.itertuples()
+    ]
+    return rows, total
+
+
+def execute(
+    query: str,
+    spec: IntentSpec,
+    planned: list[PlannedStep],
+    df: pd.DataFrame | None = None,
+    accounts: pd.DataFrame | None = None,
+) -> RiskResult:
+    t_start = time.time()
+    steps_out: list[PlanStep] = []
+    ctx: dict = {}
+
+    def run_step(step: PlannedStep) -> None:
+        if not step.invoke:
+            steps_out.append(
+                PlanStep(tool=step.tool, action="skipped", reason=step.reason, params=step.params)
+            )
+            return
+        t0 = time.time()
+        _dispatch(step)
+        steps_out.append(
+            PlanStep(
+                tool=step.tool,
+                action="invoked",
+                reason=step.reason,
+                params=step.params,
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+        )
+
+    def _dispatch(step: PlannedStep) -> None:
+        if step.tool == "load_data":
+            ctx["df"] = df if df is not None else load_sample()
+            ctx["accounts"] = accounts if accounts is not None else load_accounts()
+        elif step.tool == "apply_filters":
+            ctx["slice"], ctx["filters_applied"] = apply_filters(
+                ctx["df"], spec.filters, ctx["accounts"]
+            )
+        elif step.tool == "eda":
+            ctx["eda"] = run_eda(ctx["slice"])
+        elif step.tool == "feature_engineering":
+            ctx["features"] = build_features(ctx["slice"])
+        elif step.tool == "rule_detection":
+            ctx["signals"] = run_rules(
+                ctx["slice"], ctx["features"], patterns=step.params.get("patterns")
+            )
+        elif step.tool == "ml_anomaly":
+            # population-fit scores (cached): same account → same score on
+            # every query; candidates restricted to the query's slice
+            scores = population_anomaly_scores(ctx["df"])
+            slice_accounts = pd.unique(
+                pd.concat(
+                    [ctx["slice"]["from_account"], ctx["slice"]["to_account"]],
+                    ignore_index=True,
+                )
+            )
+            ctx["ml_scores"] = scores[scores.index.isin(slice_accounts)]
+        elif step.tool == "aggregation":
+            rows, total = _aggregation(ctx["slice"], ctx["accounts"], step.params)
+            ctx["aggregation"], ctx["aggregation_total"] = rows, total
+        elif step.tool == "entity_lookup":
+            ids: list[str] = []
+            if spec.filters.account:
+                ids = [spec.filters.account]
+            elif spec.filters.customer:
+                ids = resolve_customer_accounts(spec.filters.customer, ctx["accounts"])
+            ctx["entity_accounts"] = ids
+            ctx["prior_flags"] = [
+                {
+                    "entity_id": fl.entity_id,
+                    "pattern": fl.pattern,
+                    "risk_level": fl.risk_level,
+                    "reason": fl.reason,
+                    "flagged_at": str(fl.created_at),
+                }
+                for a in ids
+                for fl in flags_for_entity(a)
+            ]
+        elif step.tool == "risk_classification":
+            # classify everything, then truncate for transport — the KPIs must
+            # report what was actually FOUND, not the display cap.
+            all_flags = classify(
+                ctx.get("signals", []), ctx.get("ml_scores"), top_n=10**9
+            )
+            ctx["all_flags"] = all_flags
+            ctx["flags"] = all_flags[: spec.top_n]
+
+    for step in planned:
+        run_step(step)
+
+    flags: list[Flag] = ctx.get("flags", [])
+    all_flags: list[Flag] = ctx.get("all_flags", flags)
+
+    # KPIs for the workbench strip — totals are the true counts across the
+    # whole analysed slice; *_shown is how many were returned for display.
+    slice_df = ctx.get("slice", ctx.get("df"))
+    kpis = {
+        "transactions_scanned": int(len(slice_df)) if slice_df is not None else 0,
+        "flags_raised": len(all_flags),
+        "flags_shown": len(flags),
+        "high_risk": sum(1 for f in all_flags if f.risk_level.value == "high"),
+        "elapsed_ms": int((time.time() - t_start) * 1000),
     }
-    invoked_tools: list[str] = []
-    execution_timings_ms: dict[str, float] = {}
-    completed_steps = 0
-    failed_tool: str | None = None
+    if ctx.get("aggregation") is not None:
+        kpis["aggregation_matches"] = ctx.get("aggregation_total", len(ctx["aggregation"]))
+        kpis["aggregation_shown"] = len(ctx["aggregation"])
 
-    for step in execution_plan.steps:
-        step.status = StepStatus.IN_PROGRESS
-        invoked_tools.append(step.tool_name)
-        step_start = time.perf_counter()
-        try:
-            result, summary = _dispatch_step(step, execution_plan, context)
-        except Exception as error:
-            step.status = StepStatus.FAILED
-            step.result_summary = f"{type(error).__name__}: {error}"
-            context["error"] = {
-                "step_number": step.step_number,
-                "tool_name": step.tool_name,
-                "message": step.result_summary,
-            }
-            failed_tool = step.tool_name
-            break
-        finally:
-            timing_key = _next_timing_key(step.tool_name, execution_timings_ms)
-            execution_timings_ms[timing_key] = max(
-                0.0,
-                (time.perf_counter() - step_start) * 1000,
-            )
+    charts: dict = {}
+    if "eda" in ctx:
+        charts.update(ctx["eda"]["charts"])
+        kpis["eda_summary"] = {
+            k: v for k, v in ctx["eda"].items() if k not in ("charts",)
+        }
+    if flags:
+        level_counts = Counter(f.risk_level.value for f in flags)
+        charts["risk_breakdown"] = [
+            {"level": lvl, "count": level_counts.get(lvl, 0)}
+            for lvl in ("high", "medium", "low")
+        ]
+    if ctx.get("aggregation") is not None:
+        charts["aggregation_table"] = ctx["aggregation"]
+    if ctx.get("prior_flags") is not None:
+        charts["prior_flags"] = ctx["prior_flags"]
+        charts["entity_accounts"] = ctx.get("entity_accounts", [])
 
-        step.result_summary = summary
-        step.status = StepStatus.COMPLETED
-        context[f"{step.tool_name}_result"] = result
-        completed_steps += 1
-
-    execution_plan.invoked_tools = invoked_tools
-    trace = _build_execution_trace(
-        execution_plan=execution_plan,
-        invoked_tools=invoked_tools,
-        execution_timings_ms=execution_timings_ms,
-        total_execution_time_ms=max(0.0, (time.perf_counter() - workflow_start) * 1000),
-        completed_steps=completed_steps,
-        failed_tool=failed_tool,
-        error=context.get("error"),
+    plan = ExecutionPlan(
+        query=query,
+        intent=spec.intent,
+        pattern=spec.pattern,
+        filters=spec.filters,
+        steps=steps_out,
     )
-
-    return {"plan": execution_plan, "context": context, "trace": trace}
-
-
-def _build_execution_trace(
-    execution_plan: ExecutionPlan,
-    invoked_tools: list[str],
-    execution_timings_ms: dict[str, float],
-    total_execution_time_ms: float,
-    completed_steps: int,
-    failed_tool: str | None,
-    error: dict[str, Any] | None,
-) -> ExecutionTrace:
-    """Build telemetry from actual runtime execution without mutating plan inputs."""
-    if failed_tool is None:
-        status = TraceStatus.SUCCESS
-        error_message = None
-    else:
-        status = TraceStatus.PARTIAL_SUCCESS if completed_steps else TraceStatus.FAILED
-        failure_message = error.get("message", "Execution failed") if error else "Execution failed"
-        error_message = f"{failed_tool}: {failure_message}"
-
-    return ExecutionTrace(
-        query_id=execution_plan.plan_id,
-        detected_intent=execution_plan.detected_intent,
-        active_filters=deepcopy(execution_plan.active_filters),
-        invoked_tools=invoked_tools.copy(),
-        skipped_tools=[tool.model_copy(deep=True) for tool in execution_plan.skipped_tools],
-        execution_timings_ms=execution_timings_ms.copy(),
-        total_execution_time_ms=total_execution_time_ms,
-        status=status,
-        error_message=error_message,
-    )
-
-
-def _next_timing_key(tool_name: str, timings: dict[str, float]) -> str:
-    """Return a stable, non-conflicting timing key for a tool invocation."""
-    if tool_name not in timings:
-        return tool_name
-
-    occurrence = 2
-    while f"{tool_name}#{occurrence}" in timings:
-        occurrence += 1
-    return f"{tool_name}#{occurrence}"
-
-
-def _dispatch_step(
-    step: PlanStep,
-    plan: ExecutionPlan,
-    context: dict[str, Any],
-) -> tuple[Any, str]:
-    if step.tool_name == "eda":
-        result = run_eda(
-            context[CURRENT_TRANSACTIONS],
-            **_compatible_parameters(step.parameters, {"top_n"}),
-        )
-        context["eda_result"] = result
-        return result, f"EDA completed with {len(result)} report sections"
-
-    if step.tool_name == "features":
-        result = engineer_features(
-            context[CURRENT_TRANSACTIONS],
-            **_compatible_parameters(step.parameters, {"window", "sub_threshold"}),
-        )
-        context["featured_transactions"] = result
-        context[CURRENT_TRANSACTIONS] = result
-        return result, f"Engineered {len(FEATURE_COLUMNS)} features for {len(result)} transactions"
-
-    if step.tool_name == "detectors_ml":
-        featured_transactions = context.get("featured_transactions")
-        if featured_transactions is None:
-            featured_transactions = engineer_features(
-                context[RAW_TRANSACTIONS],
-                **_compatible_parameters(step.parameters, {"window", "sub_threshold"}),
-            )
-            context["featured_transactions"] = featured_transactions
-
-        result = detect_anomalies(
-            featured_transactions,
-            **_compatible_parameters(step.parameters, {"contamination", "random_state"}),
-        )
-        context["ml_scored_transactions"] = result
-        context[CURRENT_TRANSACTIONS] = result
-        anomaly_count = int(result["is_anomaly"].sum()) if "is_anomaly" in result else 0
-        return result, f"ML scored {len(result)} transactions and found {anomaly_count} anomalies"
-
-    if step.tool_name == "detectors_rules":
-        result = run_rule_detectors(
-            context[RAW_TRANSACTIONS],
-            **_compatible_parameters(step.parameters, {"entity_id", "rules"}),
-        )
-        context["rule_flags"] = result
-        return result, f"Rule detectors produced {len(result)} flags"
-
-    if step.tool_name == "risk":
-        rule_flags = context.get("rule_flags", [])
-        entity_id = _resolve_entity_id(step, plan)
-        ml_score = _normalized_ml_risk_score(
-            context.get("ml_scored_transactions"),
-            entity_id,
-        )
-
-        if entity_id:
-            result = fuse_entity_risk(
-                entity_id=entity_id,
-                flags=rule_flags,
-                ml_score=ml_score,
-            )
-        else:
-            result = fuse_overall_risk(
-                flags=rule_flags,
-                ml_score=ml_score,
-                total_transactions=len(context[RAW_TRANSACTIONS]),
-            )
-
-        context["risk_result"] = result
-        return result, f"Risk fusion completed: {result.risk_tier.value} ({result.risk_score:.4f})"
-
-    if step.tool_name == "explain":
-        result = explain_flags(context.get("rule_flags", []))
-        context["explanations"] = result
-        return result, f"Generated {len(result)} flag explanations"
-
-    raise ValueError(f"Unsupported plan tool: {step.tool_name}")
-
-
-def _compatible_parameters(
-    parameters: dict[str, Any],
-    supported_names: set[str],
-) -> dict[str, Any]:
-    return {
-        name: value
-        for name, value in parameters.items()
-        if name in supported_names
-    }
-
-
-def _resolve_entity_id(step: PlanStep, plan: ExecutionPlan) -> str | None:
-    parameter_entity = step.parameters.get("entity_id")
-    if isinstance(parameter_entity, str) and parameter_entity:
-        return parameter_entity
-    return plan.target_entities[0] if plan.target_entities else None
-
-
-def _normalized_ml_risk_score(
-    scored_transactions: pd.DataFrame | None,
-    entity_id: str | None,
-) -> float | None:
-    """Return a finite, batch-normalized ML score for risk fusion.
-
-    Isolation Forest anomaly scores are unbounded, so they are min-max
-    normalized across the scored batch before selecting an overall or
-    entity-specific maximum. Higher values remain more anomalous.
-    """
-    if scored_transactions is None or "anomaly_score" not in scored_transactions.columns:
-        return None
-
-    numeric_scores = pd.to_numeric(
-        scored_transactions["anomaly_score"],
-        errors="coerce",
-    )
-    finite_mask = np.isfinite(numeric_scores.to_numpy(dtype=float, na_value=np.nan))
-    finite_scores = numeric_scores.loc[finite_mask]
-    if finite_scores.empty:
-        return None
-
-    minimum = float(finite_scores.min())
-    maximum = float(finite_scores.max())
-    if minimum == maximum:
-        normalized_scores = pd.Series(0.0, index=finite_scores.index)
-    else:
-        normalized_scores = (finite_scores - minimum) / (maximum - minimum)
-
-    if entity_id is None:
-        return float(normalized_scores.max())
-
-    required_entity_columns = {"From Account", "To Account"}
-    if not required_entity_columns.issubset(scored_transactions.columns):
-        return None
-
-    entity_mask = (
-        (scored_transactions["From Account"] == entity_id)
-        | (scored_transactions["To Account"] == entity_id)
-    )
-    matching_finite_rows = entity_mask.to_numpy(dtype=bool, na_value=False)[finite_mask]
-    entity_scores = normalized_scores.iloc[np.flatnonzero(matching_finite_rows)]
-    return float(entity_scores.max()) if not entity_scores.empty else None
+    run_id = record_run(plan, flags)
+    return RiskResult(run_id=run_id, plan=plan, flags=flags, kpis=kpis, charts=charts)
