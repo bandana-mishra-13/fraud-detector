@@ -32,9 +32,9 @@ function availableTabs(result: RiskResult): string[] {
     );
   const hasCharts = Boolean(
     result.charts.txns_per_day ||
-      result.charts.payment_formats ||
-      result.charts.risk_breakdown ||
-      result.charts.top_senders,
+    result.charts.payment_formats ||
+    result.charts.risk_breakdown ||
+    result.charts.top_senders,
   );
 
   if (isAggregation) tabs.push("Results");
@@ -144,11 +144,10 @@ function FilterBar({
               type="button"
               disabled={empty}
               onClick={() => onRisk(l.id)}
-              className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11.5px] font-medium transition-[background-color,color,box-shadow] duration-150 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${
-                active
+              className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11.5px] font-medium transition-[background-color,color,box-shadow] duration-150 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${active
                   ? "bg-white text-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.1)]"
                   : "text-gray-500 hover:text-slate-700"
-              }`}
+                }`}
             >
               {l.dot && <span className={`h-1.5 w-1.5 rounded-full ${l.dot}`} />}
               {l.label}
@@ -338,7 +337,8 @@ function ResultsTable({ rows }: { rows: AggregationRow[] }) {
 function ChartsTab({ result }: { result: RiskResult }) {
   const c = result.charts;
   return (
-    <div className="grid gap-4 p-4 lg:grid-cols-2">
+    <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      <div className="grid gap-4 lg:grid-cols-2">
       {c.txns_per_day && (
         <ChartCard title="Transactions per day">
           <ColumnChart
@@ -376,6 +376,7 @@ function ChartsTab({ result }: { result: RiskResult }) {
           />
         </ChartCard>
       )}
+      </div>
     </div>
   );
 }
@@ -444,9 +445,8 @@ export default function ResultsTabs({
               role="tab"
               aria-selected={t === tab}
               onClick={() => setSelected(t)}
-              className={`rounded-md px-3.5 py-1.5 text-[12.5px] font-medium transition-[background-color,color,box-shadow] duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${
-                t === tab ? "bg-white text-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.08)]" : "text-gray-500 hover:text-slate-700"
-              }`}
+              className={`rounded-md px-3.5 py-1.5 text-[12.5px] font-medium transition-[background-color,color,box-shadow] duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${t === tab ? "bg-white text-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.08)]" : "text-gray-500 hover:text-slate-700"
+                }`}
             >
               {t}
             </button>
