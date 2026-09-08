@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import time
-import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.executor import execute_plan
@@ -26,6 +23,7 @@ from app.models.schemas import (
 from app.storage.audit_store import AuditStore, get_audit_store
 from app.tools.data_loader import load_transactions
 from app.tools.sampler import sample_transactions
+from app.utils.query_cache import build_query_cache_key, query_response_cache
 
 router = APIRouter(tags=["Investigation Query"])
 
@@ -88,7 +86,6 @@ async def execute_query(
     request: QueryRequest,
     audit_store: AuditStore = Depends(get_audit_store),
 ) -> QueryResponse:
-    start_time = time.perf_counter()
     clean_query = request.query.strip()
     if not clean_query:
         raise HTTPException(
@@ -96,14 +93,26 @@ async def execute_query(
             detail="Query string cannot be empty.",
         )
 
+    dataset_name = request.dataset_path or "synthetic_transactions.csv"
+    cache_key = build_query_cache_key(
+        query=clean_query,
+        dataset_path=dataset_name,
+        normal_sample_size=request.normal_sample_size,
+        filters=request.filters,
+    )
+    cached_response = query_response_cache.get(cache_key)
+    if cached_response is not None:
+        # A hit returns the original investigation identity and trace; it is not re-audited.
+        return QueryResponse.model_validate(cached_response)
+
     # 1. Parse natural language intent
     try:
         parsed_intent = await parse_intent_async(clean_query)
-    except Exception as e:
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error parsing query intent: {e}",
-        )
+            detail="Unable to parse the investigation query.",
+        ) from error
 
     if request.filters:
         parsed_intent.filters.update(request.filters)
@@ -111,39 +120,39 @@ async def execute_query(
     # 2. Synthesize dynamic execution plan
     try:
         plan = await create_execution_plan_async(parsed_intent)
-    except Exception as e:
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error generating execution plan: {e}",
-        )
+            detail="Unable to generate an investigation plan.",
+        ) from error
 
     # 3. Load dataset
     try:
-        dataset_name = request.dataset_path or "synthetic_transactions.csv"
         df = load_transactions(dataset_name)
         if request.normal_sample_size is not None:
             df = sample_transactions(df, normal_sample_size=request.normal_sample_size)
-    except FileNotFoundError as e:
+    except FileNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Dataset not found: {e}",
-        )
-    except Exception as e:
+            detail="Dataset not found.",
+        ) from error
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error loading transaction data: {e}",
-        )
+            detail="Unable to load transaction data.",
+        ) from error
 
     # 4. Execute plan steps sequentially
     try:
         execution_output = execute_plan(plan, df)
         executed_plan: ExecutionPlan = execution_output["plan"]
         context: Dict[str, Any] = execution_output["context"]
-    except Exception as e:
+        trace: ExecutionTrace = execution_output["trace"]
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during plan execution: {e}",
-        )
+            detail="Unable to execute the investigation plan.",
+        ) from error
 
     # 5. Synthesize executive summary & findings
     try:
@@ -157,30 +166,7 @@ async def execute_query(
     explanations: List[Dict[str, Any]] = context.get("explanations", [])
     eda_result: Optional[Dict[str, Any]] = context.get("eda_result")
 
-    # 7. Compile ExecutionTrace
-    total_duration_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
-    has_error = bool(context.get("error"))
-    trace_status = (
-        TraceStatus.FAILED
-        if has_error and not flags and not risk_result
-        else (TraceStatus.PARTIAL_SUCCESS if has_error else TraceStatus.SUCCESS)
-    )
-
-    trace = ExecutionTrace(
-        trace_id=str(uuid.uuid4()),
-        query_id=plan.plan_id,
-        detected_intent=executed_plan.detected_intent,
-        active_filters=executed_plan.active_filters,
-        invoked_tools=executed_plan.invoked_tools,
-        skipped_tools=executed_plan.skipped_tools,
-        execution_timings_ms={},
-        total_execution_time_ms=total_duration_ms,
-        status=trace_status,
-        error_message=context.get("error", {}).get("message") if has_error else None,
-        created_at=datetime.now(timezone.utc),
-    )
-
-    # 8. Persist query trace and flags to SQLite Audit Store
+    # 7. Persist query trace and flags to SQLite Audit Store
     try:
         audit_store.log_execution_trace(trace, query_text=clean_query)
         if flags:
@@ -188,7 +174,7 @@ async def execute_query(
     except Exception:
         pass
 
-    return QueryResponse(
+    response = QueryResponse(
         query_id=plan.plan_id,
         query=clean_query,
         parsed_intent=parsed_intent,
@@ -200,3 +186,7 @@ async def execute_query(
         explanations=explanations,
         eda_summary=eda_result,
     )
+    if trace.status == TraceStatus.SUCCESS:
+        query_response_cache.set(cache_key, response.model_dump(mode="json"))
+
+    return response
