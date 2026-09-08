@@ -1,107 +1,38 @@
-# Python & Virtual Environments
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-/lib/
-/lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-.venv/
-venv/
-ENV/
-env/
-*.venv
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Jupyter Notebooks
-.ipynb_checkpoints/
-
-# Environment Variables & Secrets (CRITICAL)
+# ── Secrets ──────────────────────────────────────────
 .env
 .env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.*
-!.env.example
-*.pem
 *.key
-*.pfx
+kaggle.json
 
-# Node.js & Frontend (Next.js)
-node_modules/
-.next/
-out/
-coverage/
-.npm
-.yarn/
-.pnpm-store/
-*.tsbuildinfo
-next-env.d.ts
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Machine Learning Artifacts & Databases
+# ── Data (too large / sourced independently) ─────────
+archive/
+backend/data/*.csv
+backend/data/*.txt
+backend/data/*.parquet
+backend/data/raw/
 *.db
 *.sqlite
 *.sqlite3
-backend/storage/*.db
-backend/storage/*.sqlite
-*.pkl
-*.joblib
-*.onnx
-*.h5
-*.pt
-*.pth
 
-# Large Data & Datasets (never commit >100MB to git)
-archive/
-backend/data/HI-Small_Trans.csv
-!backend/data/synthetic_transactions.csv
-*.zip
-*.tar.gz
-*.parquet
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
+# ── Python ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Logs
-*.log
-logs/
+# ── Node / Next.js ───────────────────────────────────
+node_modules/
+.next/
+out/
+frontend/.env*.local
+npm-debug.log*
 
-# Operating System & IDEs
+# ── OS / Editor ──────────────────────────────────────
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
 .vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
 .idea/
 *.swp
-*.swo
-*~
+PLAN.md
