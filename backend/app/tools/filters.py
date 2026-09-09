@@ -4,19 +4,36 @@ from ..models.schemas import QueryFilters
 
 
 def resolve_customer_accounts(customer: str, accounts: pd.DataFrame) -> list[str]:
-    """Map a customer reference to account numbers."""
+    """Map a customer reference to account numbers.
+
+    Tries, in order:
+    1. Exact match on entity_id (the customer identifier).
+    2. Name-suffix match on entity_name (e.g. "#4521").
+    3. Direct match on account number — users often say "customer 100428738"
+       when they mean "the customer who owns account 100428738".
+    """
     ref = customer.strip()
     number = ref.lstrip("#")
     
-    # Use case-insensitive matching for robustness
+    # 1. Exact entity_id match (case-insensitive)
     by_id = accounts[accounts["entity_id"].astype(str).str.fullmatch(ref, case=False, na=False)]
     if not by_id.empty:
         return by_id["account"].tolist()
         
+    # 2. Name-suffix match (e.g. entity_name ends with "#4521")
     by_name = accounts[
         accounts["entity_name"].astype(str).str.lower().str.endswith(f"#{number}".lower(), na=False)
     ]
-    return by_name["account"].tolist()
+    if not by_name.empty:
+        return by_name["account"].tolist()
+
+    # 3. Fallback: the reference might be an account number itself — users
+    #    often say "customer X" when they actually mean "account X".
+    by_account = accounts[accounts["account"].astype(str).str.fullmatch(ref, case=False, na=False)]
+    if not by_account.empty:
+        return by_account["account"].tolist()
+
+    return []
 
 
 def apply_filters(
